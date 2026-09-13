@@ -21,12 +21,16 @@ export const SourceMixCard: React.FC<SourceMixCardProps> = ({
   const renewableKw = windKw + solarKw + bessKw;
   const renewablePct = totalLoad > 0 ? Math.round((renewableKw / totalLoad) * 100) : 0;
 
-  const data = [
-    { name: 'WIND-TURBINE', value: windKw, color: '#00f0ff', hex: '#00f0ff', pct: totalLoad > 0 ? Math.round((windKw / totalLoad) * 100) : 0 },
-    { name: 'SOLAR PV ARRAY', value: solarKw, color: '#0284c7', hex: '#0284c7', pct: totalLoad > 0 ? Math.round((solarKw / totalLoad) * 100) : 0 },
-    { name: 'BESS STORAGE', value: bessKw, color: '#0891b2', hex: '#0891b2', pct: totalLoad > 0 ? Math.round((bessKw / totalLoad) * 100) : 0 },
-    { name: 'DIESEL', value: dieselKw, color: '#f59e0b', hex: '#f59e0b', pct: totalLoad > 0 ? Math.round((dieselKw / totalLoad) * 100) : 0 },
+  const allSources = [
+    { name: 'WIND-TURBINE', value: windKw, color: '#00f0ff', pct: totalLoad > 0 ? Math.round((windKw / totalLoad) * 100) : 0 },
+    { name: 'SOLAR PV ARRAY', value: solarKw, color: '#f59e0b', pct: totalLoad > 0 ? Math.round((solarKw / totalLoad) * 100) : 0 },
+    { name: 'BESS STORAGE', value: bessKw, color: '#0891b2', pct: totalLoad > 0 ? Math.round((bessKw / totalLoad) * 100) : 0 },
+    { name: 'DIESEL GEN', value: dieselKw, color: '#ef4444', pct: totalLoad > 0 ? Math.round((dieselKw / totalLoad) * 100) : 0 },
   ];
+  // Only pass non-zero sources to pie chart — Recharts 0° arc slices corrupt rendering
+  const pieData = allSources.filter(s => s.value > 0);
+  // Legend always shows all sources so operators see 0 kW readings
+  const data = allSources;
 
   return (
     <div className="hud-card p-4 sm:p-5 flex flex-col justify-between h-full font-mono">
@@ -60,7 +64,7 @@ export const SourceMixCard: React.FC<SourceMixCardProps> = ({
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
                 <Pie
-                  data={data}
+                  data={pieData}
                   cx="50%"
                   cy="50%"
                   innerRadius={54}
@@ -70,7 +74,7 @@ export const SourceMixCard: React.FC<SourceMixCardProps> = ({
                   stroke="#1e1e1e"
                   strokeWidth={2}
                 >
-                  {data.map((entry, index) => (
+                  {pieData.map((entry, index) => (
                     <Cell key={`cell-${index}`} fill={entry.color} />
                   ))}
                 </Pie>
@@ -104,18 +108,21 @@ export const SourceMixCard: React.FC<SourceMixCardProps> = ({
         {/* Legend Breakdown */}
         <div className="md:col-span-6 flex flex-col gap-2.5 pl-0 md:pl-2">
           {data.map((item) => (
-            <div key={item.name} className="flex items-center justify-between text-xs">
+            <div
+              key={item.name}
+              className={`flex items-center justify-between text-xs transition-opacity duration-300 ${item.value === 0 ? 'opacity-30' : 'opacity-100'}`}
+            >
               <div className="flex items-center gap-2">
                 <span
-                  className="w-1.5 h-4 rounded-sm shadow-[0_0_8px_currentColor]"
-                  style={{ backgroundColor: item.color, color: item.color }}
+                  className="w-1.5 h-4 rounded-sm"
+                  style={{ backgroundColor: item.value > 0 ? item.color : '#374151', boxShadow: item.value > 0 ? `0 0 8px ${item.color}` : 'none' }}
                 ></span>
                 <span className="text-slate-300 font-medium text-[11px] tracking-wider">
                   {item.name}
                 </span>
               </div>
               <div className="text-right">
-                <span className="font-telemetry font-bold text-slate-100 text-[11px]">
+                <span className={`font-telemetry font-bold text-[11px] ${item.value > 0 ? 'text-slate-100' : 'text-slate-500'}`}>
                   {item.value.toFixed(1)} kW
                 </span>
                 <span className="text-slate-400 text-[10px] ml-1.5">
