@@ -1,39 +1,19 @@
 #!/usr/bin/env python3
 """
-UseModel.py  (originally predict_power.py)
+predict_power.py
 
 FastAPI service. POST/GET a lat/lon, it fetches current weather (via
 weather_api.weather.fetch_current), runs it through the trained solar and
 wind power models, fills in the two `None` output placeholders, and
 returns the modified dict as JSON.
 
-Both models are autoregressive: they were trained on their *own previous
-predictions* as input features -- solar on power_lag_1/2/3, wind on
-pow_lag_1/2/3 -- to predict the *next* value. A single live weather
-snapshot has no such history on its own, so this script keeps a small
-JSON cache on disk (keyed by lat/lon) of each model's last few
-predictions and feeds those back in as the lag inputs on the next run.
-On the very first run for a given location, lags are bootstrapped to 0.0.
-
-IMPORTANT -- checkpoint feature schema (verified directly from the .pt
-files, not assumed):
-    solar_power_model.pt feature_cols:
-        Total solar irradiance (W/m2), Direct normal irradiance (W/m2),
-        Global horizontal irradiance (W/m2), Air temperature (°C),
-        Atmosphere (hpa), Relative humidity (%),
-        power_lag_1, power_lag_2, power_lag_3
-        lags = [1, 2, 3], target_col = "Power (MW)"
-
-    wind_power_model.pt feature_cols:
-        wind_speed, temp, prs, hum,
-        pow_lag_1, pow_lag_2, pow_lag_3
-        lags = [1, 2, 3], target_col = "pow_out"
-
-    Both models use the SAME lag scheme (their own last 3 outputs) --
-    there is no wind_speed_sq/wind_speed_cub engineered feature and no
-    single-value pow_out_lag in the actual wind checkpoint, despite an
-    earlier version of this file assuming that. build_wind_feature_vec()
-    below mirrors build_solar_feature_vec()'s history-based approach.
+Both models are autoregressive: they were trained on the *previous* power
+reading as an input feature (power_lag_1/2/3 for solar, pow_out_lag for
+wind), predicting the *next* one. A single live weather snapshot has no
+such history on its own, so this script keeps a small JSON cache on disk
+(keyed by lat/lon) of the last predictions and feeds those back in as the
+lag inputs on the next run. On the very first run for a given location,
+lags are bootstrapped to 0.0.
 
 OOD safety (unchanged from the CLI version):
     1. check_in_distribution() -- flags any raw input feature that falls
@@ -56,12 +36,12 @@ don't exist yet under <project root>/models/, this router's /predict
 endpoint will return a 503 rather than crash the whole app -- see
 _ensure_models_loaded().
 
-This file lives at backend/UseModel.py so the relative paths to
+This file lives at backend/predict_power.py so the relative paths to
 ../models/*.pt and ./weather_api/weather.py resolve correctly.
 
 Run it (from the project root, via backend/__init__.py:create_app -- see
 main.py):
-    uvicorn wsgi:app --reload
+    uvicorn main:app --host 0.0.0.0 --port 8000
 
 Then call it:
     GET  http://localhost:8000/predict?lat=28.6&lon=77.2
@@ -83,10 +63,11 @@ from pydantic import BaseModel
 # Wire up to weather_api/weather.py (fetch_current + the shared column
 # name constants), assuming this script lives alongside that folder.
 #
-# We insert THIS file's own directory (backend/) onto sys.path, not
-# backend/weather_api/. Inserting the weather_api/ folder itself would
-# make `import weather_api.weather` look for
-# backend/weather_api/weather_api/weather.py, which doesn't exist.
+# NOTE: the fix here vs. the original draft -- we insert THIS file's own
+# directory (backend/) onto sys.path, not backend/weather_api/. Inserting
+# the weather_api/ folder itself would make `import weather_api.weather`
+# look for backend/weather_api/weather_api/weather.py, which doesn't
+# exist and would ImportError at startup.
 # --------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weather_api.weather import (  # noqa: E402
@@ -166,9 +147,8 @@ def apply_wind_cutout_ceiling(pred, raw, cutout=WIND_CUT_OUT_SPEED):
 
 
 # --------------------------------------------------------------------------
-# Model architecture -- must match the training scripts exactly so the
-# saved state_dict keys line up. Both checkpoints use this same class;
-# use_batchnorm is auto-detected per-checkpoint below.
+# Model architectures -- must match the two training scripts exactly so
+# the saved state_dict keys line up.
 # --------------------------------------------------------------------------
 class PowerMLP(nn.Module):
     """Unified MLP whose layout is chosen to match what a checkpoint was
@@ -279,9 +259,6 @@ def _predict_with_uncertainty(model, ckpt, feature_vec, device, n_samples=30):
 
 # --------------------------------------------------------------------------
 # Lag cache -- one entry per (lat, lon), bootstraps to 0.0 on first run.
-# Both solar and wind now store a short *history list* of their own past
-# predictions (not a single scalar), since both checkpoints use 3-step
-# autoregressive lags.
 # --------------------------------------------------------------------------
 def _cache_key(lat, lon):
     return f"{lat:.4f}_{lon:.4f}"
@@ -303,15 +280,8 @@ def _save_cache(cache):
 
 
 def _get_location_state(cache, lat, lon):
-    """Defaults missing keys individually so this works whether the cache
-    entry is brand new, or an older entry saved before wind switched from
-    a single 'wind_pow_out_lag' scalar to a 'wind_power_history' list."""
     key = _cache_key(lat, lon)
-    entry = cache.get(key, {})
-    return {
-        "solar_power_history": entry.get("solar_power_history", []),
-        "wind_power_history": entry.get("wind_power_history", []),
-    }
+    return cache.get(key, {"solar_power_history": [], "wind_pow_out_lag": 0.0})
 
 
 def _set_location_state(cache, lat, lon, state):
@@ -320,10 +290,7 @@ def _set_location_state(cache, lat, lon, state):
 
 # --------------------------------------------------------------------------
 # Feature builders -- order MUST follow ckpt["feature_cols"], since that's
-# what x_mean/x_std were fit against. Both solar and wind checkpoints use
-# the same "last N of my own past outputs" lag scheme, so these two
-# builders are structurally identical -- only the raw-feature fallback
-# and the lag key prefix ("power_lag_" vs "pow_lag_") differ.
+# what x_mean/x_std were fit against.
 # --------------------------------------------------------------------------
 def build_solar_feature_vec(raw, ckpt, power_history):
     """power_history: past Power (MW) predictions, oldest first.
@@ -342,29 +309,20 @@ def build_solar_feature_vec(raw, ckpt, power_history):
     return vec
 
 
-def build_wind_feature_vec(raw, ckpt, pow_history):
-    """pow_history: past pow_out predictions, oldest first.
-    lag_k = value k steps back; missing history bootstraps to 0.0.
-
-    NOTE: the trained wind_power_model.pt checkpoint's feature_cols are
-    ['wind_speed', 'temp', 'prs', 'hum', 'pow_lag_1', 'pow_lag_2',
-    'pow_lag_3'] -- confirmed directly from the checkpoint. There is no
-    wind_speed_sq/wind_speed_cub engineered feature and no single-value
-    pow_out_lag; an earlier version of this function assumed both and
-    that's what caused KeyError('hum') plus a feature-vector shape
-    mismatch once that was fixed.
-    """
-    feature_cols = ckpt["feature_cols"]
-    lags = ckpt.get("lags", [1, 2, 3])
-
-    lag_values = {
-        f"pow_lag_{lag}": (pow_history[-lag] if len(pow_history) >= lag else 0.0)
-        for lag in lags
-    }
+def build_wind_feature_vec(raw, ckpt, pow_out_lag):
+    feature_cols = ckpt["feature_cols"]  # base weather + pow_out_lag + ws^2 + ws^3
+    ws = raw["wind_speed"]
 
     vec = []
     for col in feature_cols:
-        vec.append(lag_values[col] if col in lag_values else raw[col])
+        if col == "pow_out_lag":
+            vec.append(pow_out_lag)
+        elif col == "wind_speed_sq":
+            vec.append(ws ** 2)
+        elif col == "wind_speed_cub":
+            vec.append(ws ** 3)
+        else:
+            vec.append(raw[col])
     return vec
 
 
@@ -419,7 +377,7 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
     solar_pred = _predict(_solar_model, _solar_ckpt, solar_vec, device)
     solar_pred = apply_solar_physics_floor(solar_pred, raw)
 
-    wind_vec = build_wind_feature_vec(raw, _wind_ckpt, state["wind_power_history"])
+    wind_vec = build_wind_feature_vec(raw, _wind_ckpt, state["wind_pow_out_lag"])
     wind_pred = _predict(_wind_model, _wind_ckpt, wind_vec, device)
     wind_pred = apply_wind_cutout_ceiling(wind_pred, raw)
 
@@ -437,10 +395,9 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
             f"{POW_TARGET_COL}_std": wind_std,
         }
 
-    max_solar_lag = max(_solar_ckpt.get("lags", [1, 2, 3]))
-    max_wind_lag = max(_wind_ckpt.get("lags", [1, 2, 3]))
-    state["solar_power_history"] = (state["solar_power_history"] + [solar_pred])[-max_solar_lag:]
-    state["wind_power_history"] = (state["wind_power_history"] + [wind_pred])[-max_wind_lag:]
+    max_lag = max(_solar_ckpt.get("lags", [1, 2, 3]))
+    state["solar_power_history"] = (state["solar_power_history"] + [solar_pred])[-max_lag:]
+    state["wind_pow_out_lag"] = wind_pred
     _set_location_state(cache, lat, lon, state)
     _save_cache(cache)
 
