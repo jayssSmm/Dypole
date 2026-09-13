@@ -148,7 +148,7 @@ SOLAR_IRRADIANCE_COLS = [
 
 # Typical utility-scale turbine cut-out speed. Tune to your actual turbine
 # spec if you have per-file capacity/model info available.
-WIND_CUT_OUT_SPEED = 25.0
+WIND_CUT_OUT_SPEED = 90
 
 
 def check_in_distribution(raw, ranges=WEATHER_VALID_RANGES):
