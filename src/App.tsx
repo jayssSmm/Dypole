@@ -284,6 +284,7 @@ export const App: React.FC = () => {
                       <LoadForecastChart
                         mode={dataSourceMode}
                         telemetry={telemetry}
+                        scheduleData={scheduleData}
                       />
                     </div>
                   </section>
