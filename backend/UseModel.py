@@ -87,6 +87,7 @@ Then call it:
 import json
 import math
 import os
+import random
 import sys
 from datetime import datetime
 
@@ -465,6 +466,29 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
 
 
 # ==========================================================================
+# UNIT NOTE -- resolved 2026-09: the checkpoint's target column is named
+# "Power (MW)", but that label is misleading, not literal. Comparing
+# actual model output against the real site (~220 kW total demand)
+# shows the model producing values like 59.6 for that same "Power (MW)"
+# field -- 59.6 MW from a station whose total load is 220 kW is not
+# physically sensible, whereas 59.6 kW from a modest solar array is.
+# Conclusion: the training pipeline's column name is wrong (or was
+# copied from a template for a different, much larger reference plant);
+# the values it actually learned to output are already in kW.
+#
+# Fix applied below: solar_pred / wind_pred are consumed AS-IS, in kW,
+# with no *1000 or /1000 conversion anywhere. Do NOT add a MW->kW
+# conversion factor here -- that would make the numbers 1000x too big
+# again. If you later get authoritative confirmation from whoever wrote
+# train_solar_power_model.py that the target really was megawatts for a
+# specific reference plant, this needs a capacity-factor rescale
+# instead (predicted/reference_plant_capacity * your_real_capacity) --
+# but nothing checked so far supports that; the mislabeling explanation
+# fits every sample we've seen.
+# ==========================================================================
+
+
+# ==========================================================================
 # DISPATCH ENGINE -- pasted in as provided. Priority for normal mode is
 # solar+wind -> battery -> diesel; calamity mode routes renewables to
 # charge the battery first, using any leftover to offset consumption
@@ -557,13 +581,23 @@ def dispatch_energy(consumption, solar, wind, battery_charge, battery_capacity, 
 GRID_STATE_PATH = os.path.join(_HERE, ".grid_state.json")
 
 GRID_CONFIG = {
-    "battery_capacity_kwh": 5.4,
-    "battery_usable_kwh": 2.6,          # usable range after depth-of-discharge limits -- set to your battery's real usable capacity
-    "battery_initial_kwh": 3.3,
+    # NOTE: rescaled from the earlier mock-scale numbers (battery_capacity
+    # 5.4 kWh) to match the real load figure (~220 kW). A 5.4 kWh battery
+    # would fully drain in under two minutes against a 220 kW load, which
+    # is what was producing the nonsense schedule (battery hit 0 by hour
+    # 2, diesel maxed out immediately). These are still placeholders --
+    # replace with your BESS's real capacity/usable-kWh spec -- but
+    # they're now at least the right order of magnitude for this load.
+    "battery_capacity_kwh": 200.0,
+    "battery_usable_kwh": 150.0,
+    "battery_initial_kwh": 100.0,
     "diesel_health_initial": 78.0,      # 0-100 -- placeholder; wire to a real genset health metric
     "diesel_restock_days_initial": 4.0,  # placeholder; wire to a real tank-level sensor / consumption log
-    "diesel_health_wear_per_kwh": 0.05,  # % health lost per kWh of diesel burned -- placeholder heuristic, tune to your genset
-    "diesel_daily_ration_kwh": 6.0,      # assumed kWh/day diesel budget used to burn down restock_days -- placeholder
+    # Also rescaled: these were tuned assuming diesel_kw in the 0-4 range
+    # (mock scale). At real ~100+ kW diesel dispatch they'd zero out
+    # diesel_health / restock_days_remaining in a single /schedule call.
+    "diesel_health_wear_per_kwh": 0.0005,  # % health lost per kWh of diesel burned -- placeholder heuristic, tune to your genset
+    "diesel_daily_ration_kwh": 800.0,       # assumed kWh/day diesel budget used to burn down restock_days -- placeholder, set to your genset's real daily fuel budget
 }
 
 SEVERITY_THRESHOLDS = {
@@ -575,8 +609,8 @@ SEVERITY_THRESHOLDS = {
 DEFAULT_SITE_LAT = 28.6   # placeholder -- set to your microgrid's actual site coordinates
 DEFAULT_SITE_LON = 77.2
 
-DEMAND_BASE_KW = 2.0          # placeholder flat baseline load -- no real load metering/forecast wired in yet
-DEMAND_EVENING_PEAK_KW = 2.0  # placeholder evening-peak bump on top of the baseline
+DEMAND_TARGET_KW = 220.0  # real load requirement, as given
+DEMAND_NOISE_KW = 10.0    # +/- random noise per hour, as given
 
 
 def _default_grid_state():
@@ -635,8 +669,9 @@ def _determine_severity(battery_kwh, diesel_health, restock_days_remaining):
 #   - wind: held at the current live reading (persistence), run through
 #     the actual trained wind model each hour with the same
 #     autoregression scheme.
-#   - demand: a flat baseline plus an evening bump -- there's no load
-#     metering/forecast in this codebase at all yet.
+#   - demand: 220 kW +/- random(0, 10) kW per hour, per the real load
+#     figure -- no diurnal shape applied since none was given; add one
+#     later if the real load actually varies by time of day.
 # Replace with a real hourly weather-forecast API (e.g. Open-Meteo's
 # hourly endpoint) and real load data when available; nothing else in
 # /schedule needs to change if you keep the same return shape.
@@ -684,9 +719,10 @@ def _forecast_renewable_inputs(raw_now, hours=12):
 
 
 def _forecast_demand_kw(hour_of_day):
-    """Flat baseline plus an evening bump centered on 19:00 -- placeholder
-    until real load metering/forecasting exists."""
-    return DEMAND_BASE_KW + DEMAND_EVENING_PEAK_KW * math.exp(-((hour_of_day - 19) ** 2) / 8)
+    """Real load requirement: 220 kW +/- random(0, 10) kW per hour.
+    hour_of_day is accepted but unused -- no diurnal shape was specified;
+    replace this with a real load forecast/meter feed when available."""
+    return DEMAND_TARGET_KW + random.uniform(-DEMAND_NOISE_KW, DEMAND_NOISE_KW)
 
 
 def _explain_dispatch(d, is_calamity):
