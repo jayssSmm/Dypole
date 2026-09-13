@@ -56,6 +56,18 @@ don't exist yet under <project root>/models/, this router's /predict
 endpoint will return a 503 rather than crash the whole app -- see
 _ensure_models_loaded().
 
+*** /status and /schedule added below ***
+These reuse the trained solar/wind models above to drive
+dispatch_energy() (pasted in verbatim) into the microgrid-status and
+12-hour-schedule shapes. Anything about battery/diesel telemetry or an
+hourly weather *forecast* (as opposed to the live snapshot fetch_current
+gives you) doesn't exist anywhere else in this file, so those pieces are
+implemented as clearly-marked placeholder config/heuristics -- see the
+"MICROGRID STATE" and "FORECAST HELPERS" sections. Replace them with your
+real BMS/diesel-sensor readings and a real hourly weather forecast API
+when you have them; the dispatch/endpoint wiring around them will not
+need to change.
+
 This file lives at backend/UseModel.py so the relative paths to
 ../models/*.pt and ./weather_api/weather.py resolve correctly.
 
@@ -67,11 +79,16 @@ Then call it:
     GET  http://localhost:8000/predict?lat=28.6&lon=77.2
     GET  http://localhost:8000/predict?lat=28.6&lon=77.2&uncertainty=true
     POST http://localhost:8000/predict   body: {"lat": 28.6, "lon": 77.2}
+    GET  http://localhost:8000/status
+    GET  http://localhost:8000/schedule
+    GET  http://localhost:8000/schedule?is_calamity=true
 """
 
 import json
+import math
 import os
 import sys
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -447,6 +464,339 @@ def predict_power(lat, lon, device=None, estimate_uncertainty=False):
     return raw
 
 
+# ==========================================================================
+# DISPATCH ENGINE -- pasted in as provided. Priority for normal mode is
+# solar+wind -> battery -> diesel; calamity mode routes renewables to
+# charge the battery first, using any leftover to offset consumption
+# before diesel does.
+# ==========================================================================
+def dispatch_energy(consumption, solar, wind, battery_charge, battery_capacity, is_calamity=False, result=None):
+    """
+    Dispatch decision for a microgrid with solar, wind, diesel, and battery.
+
+    Normal mode priority: solar+wind -> battery -> diesel (diesel assumed always sufficient)
+    Calamity mode priority: solar+wind -> battery charging is the goal; diesel covers
+                             consumption; any renewable left after battery is full
+                             still offsets consumption before diesel does.
+
+    Parameters:
+        consumption (float): required load (x)
+        solar (float): solar production
+        wind (float): wind production
+        battery_charge (float): current battery charge level
+        battery_capacity (float): max battery capacity
+        is_calamity (bool): True if in storm-prep mode
+
+    Returns:
+        dict with renewable_used, battery_used, battery_charged,
+        diesel_used, curtailed, new_battery_charge
+    """
+    if not result:
+        result = {
+            "renewable_used": 0.0,
+            "battery_used": 0.0,
+            "battery_charged": 0.0,
+            "diesel_used": 0.0,
+            "curtailed": 0.0,
+            "new_battery_charge": battery_charge,
+        }
+
+    renewable_total = solar + wind
+
+    if not is_calamity:
+        if renewable_total >= consumption:
+            # Renewables cover it fully; excess goes to battery (capped), rest curtailed
+            result["renewable_used"] = consumption
+            excess = renewable_total - consumption
+            room = battery_capacity - battery_charge
+            charged = min(excess, room)
+            result["battery_charged"] = charged
+            result["curtailed"] = excess - charged
+            result["new_battery_charge"] = battery_charge + charged
+        else:
+            # Renewables fall short; battery covers the gap; diesel covers the rest
+            result["renewable_used"] = renewable_total
+            deficit = consumption - renewable_total
+            drawn = min(deficit, battery_charge)
+            result["battery_used"] = drawn
+            result["diesel_used"] = deficit - drawn
+            result["new_battery_charge"] = battery_charge - drawn
+
+    else:
+        # Calamity: renewables prioritize charging the battery
+        room = battery_capacity - battery_charge
+        charged = min(renewable_total, room)
+        result["battery_charged"] = charged
+        result["new_battery_charge"] = battery_charge + charged
+
+        leftover_renewable = renewable_total - charged
+        renewable_to_consumption = min(leftover_renewable, consumption)
+        result["renewable_used"] = renewable_to_consumption
+        result["diesel_used"] = consumption - renewable_to_consumption
+        result["curtailed"] = leftover_renewable - renewable_to_consumption
+
+    return result
+
+
+# ==========================================================================
+# MICROGRID STATE (battery / diesel) -- config, persistence, severity
+#
+# None of this comes from the solar/wind models above; it's operational
+# grid state that nothing in this file previously tracked. There's no
+# real BMS/diesel-sensor feed wired in yet, so:
+#   - GRID_CONFIG's capacity/usable-kWh numbers are your battery spec --
+#     set them to the real values once (they were only guessed here to
+#     match your example payload).
+#   - diesel_health and restock_days_remaining are tracked as *persisted,
+#     heuristically-decayed* numbers (decremented by simulated diesel
+#     burn each time /schedule runs) rather than real sensor readings.
+#     Swap _load_grid_state/_save_grid_state for your real telemetry
+#     source when you have one -- everything downstream just reads
+#     grid_state["battery_kwh"] / ["diesel_health"] / ["restock_days_remaining"].
+# ==========================================================================
+GRID_STATE_PATH = os.path.join(_HERE, ".grid_state.json")
+
+GRID_CONFIG = {
+    "battery_capacity_kwh": 5.4,
+    "battery_usable_kwh": 2.6,          # usable range after depth-of-discharge limits -- set to your battery's real usable capacity
+    "battery_initial_kwh": 3.3,
+    "diesel_health_initial": 78.0,      # 0-100 -- placeholder; wire to a real genset health metric
+    "diesel_restock_days_initial": 4.0,  # placeholder; wire to a real tank-level sensor / consumption log
+    "diesel_health_wear_per_kwh": 0.05,  # % health lost per kWh of diesel burned -- placeholder heuristic, tune to your genset
+    "diesel_daily_ration_kwh": 6.0,      # assumed kWh/day diesel budget used to burn down restock_days -- placeholder
+}
+
+SEVERITY_THRESHOLDS = {
+    "battery_low_frac": 0.2,   # of usable_kwh
+    "diesel_health_low": 40.0,
+    "restock_days_low": 1.5,
+}
+
+DEFAULT_SITE_LAT = 28.6   # placeholder -- set to your microgrid's actual site coordinates
+DEFAULT_SITE_LON = 77.2
+
+DEMAND_BASE_KW = 2.0          # placeholder flat baseline load -- no real load metering/forecast wired in yet
+DEMAND_EVENING_PEAK_KW = 2.0  # placeholder evening-peak bump on top of the baseline
+
+
+def _default_grid_state():
+    return {
+        "battery_kwh": GRID_CONFIG["battery_initial_kwh"],
+        "diesel_health": GRID_CONFIG["diesel_health_initial"],
+        "restock_days_remaining": GRID_CONFIG["diesel_restock_days_initial"],
+        "last_discharge_kw": 0.0,
+    }
+
+
+def _load_grid_state():
+    if not os.path.exists(GRID_STATE_PATH):
+        return _default_grid_state()
+    try:
+        with open(GRID_STATE_PATH, "r") as f:
+            state = json.load(f)
+        # fill in any keys missing from an older state file
+        defaults = _default_grid_state()
+        defaults.update(state)
+        return defaults
+    except (json.JSONDecodeError, OSError):
+        return _default_grid_state()
+
+
+def _save_grid_state(state):
+    with open(GRID_STATE_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def _determine_severity(battery_kwh, diesel_health, restock_days_remaining):
+    usable = GRID_CONFIG["battery_usable_kwh"]
+    if (
+        diesel_health < SEVERITY_THRESHOLDS["diesel_health_low"]
+        or restock_days_remaining < SEVERITY_THRESHOLDS["restock_days_low"]
+    ):
+        return "critical"
+    if battery_kwh < usable * SEVERITY_THRESHOLDS["battery_low_frac"]:
+        return "warning"
+    return "normal"
+
+
+# ==========================================================================
+# FORECAST HELPERS (for /schedule)
+#
+# weather_api.weather only exposes fetch_current -- a single live
+# snapshot, not an hourly forecast -- so there is no real forecast data
+# source available here. The functions below build a 12-hour renewable
+# and demand forecast out of that one live reading using simple, clearly
+# labeled heuristics:
+#   - solar: a clear-sky diurnal bell curve (zero outside ~6am-6pm),
+#     scaled by how far today's live irradiance sits below/above a clear
+#     sky at the current hour ("cloud_factor"), then run through the
+#     actual trained solar model each hour, autoregressing off its own
+#     prior forecasted hour just like predict_power() does.
+#   - wind: held at the current live reading (persistence), run through
+#     the actual trained wind model each hour with the same
+#     autoregression scheme.
+#   - demand: a flat baseline plus an evening bump -- there's no load
+#     metering/forecast in this codebase at all yet.
+# Replace with a real hourly weather-forecast API (e.g. Open-Meteo's
+# hourly endpoint) and real load data when available; nothing else in
+# /schedule needs to change if you keep the same return shape.
+# ==========================================================================
+_CLEAR_SKY_PEAKS = {
+    "Total solar irradiance (W/m2)": 1000.0,
+    "Direct normal irradiance (W/m2)": 850.0,
+    "Global horizontal irradiance (W/m2)": 950.0,
+}
+
+
+def _daylight_fraction(hour_of_day):
+    if 6 <= hour_of_day <= 18:
+        return math.sin(math.pi * (hour_of_day - 6) / 12)
+    return 0.0
+
+
+def _forecast_renewable_inputs(raw_now, hours=12):
+    """Returns a list of dicts, one per forecast hour, each with a
+    synthetic 'solar_raw' weather dict (irradiance columns scaled for
+    that hour) and a 'wind_speed' value. See module-level note above."""
+    now_hour = datetime.now().hour
+    now_frac = _daylight_fraction(now_hour)
+
+    cloud_factor = 1.0
+    if now_frac > 0.05:
+        ghi_now = raw_now.get("Global horizontal irradiance (W/m2)", 0.0) or 0.0
+        clear_sky_now = _CLEAR_SKY_PEAKS["Global horizontal irradiance (W/m2)"] * now_frac
+        if clear_sky_now > 0:
+            cloud_factor = max(0.0, min(1.3, ghi_now / clear_sky_now))
+
+    forecast = []
+    for h in range(hours):
+        hour_of_day = (now_hour + h) % 24
+        frac = _daylight_fraction(hour_of_day)
+        solar_raw = dict(raw_now)
+        for col, peak in _CLEAR_SKY_PEAKS.items():
+            solar_raw[col] = round(peak * frac * cloud_factor, 1)
+        forecast.append({
+            "hour_of_day": hour_of_day,
+            "solar_raw": solar_raw,
+            "wind_speed": raw_now.get("wind_speed", 0.0),
+        })
+    return forecast
+
+
+def _forecast_demand_kw(hour_of_day):
+    """Flat baseline plus an evening bump centered on 19:00 -- placeholder
+    until real load metering/forecasting exists."""
+    return DEMAND_BASE_KW + DEMAND_EVENING_PEAK_KW * math.exp(-((hour_of_day - 19) ** 2) / 8)
+
+
+def _explain_dispatch(d, is_calamity):
+    if is_calamity:
+        if d["diesel_used"] == 0 and d["battery_charged"] > 0:
+            return "Calamity mode: renewables charging battery; leftover renewable output covers demand"
+        if d["diesel_used"] > 0 and d["battery_charged"] > 0:
+            return "Calamity mode: renewables prioritized to charge battery; diesel covers remaining demand"
+        return "Calamity mode: battery full or empty of renewable input; diesel covers demand"
+    if d["diesel_used"] == 0 and d["battery_used"] == 0:
+        if d["curtailed"] > 0:
+            return "Solar and wind cover demand with surplus charging the battery; excess curtailed"
+        if d["battery_charged"] > 0:
+            return "Solar and wind cover demand; surplus charges the battery"
+        return "Solar and wind cover demand; baseline zero-diesel preserved"
+    if d["diesel_used"] == 0 and d["battery_used"] > 0:
+        return "Renewables fall short; battery covers the deficit"
+    if d["diesel_used"] > 0 and d["battery_used"] > 0:
+        return "Battery and diesel jointly cover the renewable shortfall"
+    return "Battery depleted; diesel covers the shortfall"
+
+
+def build_schedule(lat, lon, is_calamity=False, hours=12):
+    """Runs the 12-hour dispatch loop and persists the resulting
+    battery/diesel state. Returns the list of hourly schedule dicts."""
+    raw_now = fetch_current(lat, lon)
+
+    _ensure_models_loaded()
+    if _models_missing:
+        raise RuntimeError(
+            "Trained checkpoints not found under <project root>/models/ "
+            "(solar_power_model.pt, wind_power_model.pt)."
+        )
+
+    power_cache = _load_cache()
+    loc_state = _get_location_state(power_cache, lat, lon)
+    solar_hist = list(loc_state["solar_power_history"])
+    wind_hist = list(loc_state["wind_power_history"])
+    max_solar_lag = max(_solar_ckpt.get("lags", [1, 2, 3]))
+    max_wind_lag = max(_wind_ckpt.get("lags", [1, 2, 3]))
+
+    grid_state = _load_grid_state()
+    battery_kwh = grid_state["battery_kwh"]
+
+    hourly_inputs = _forecast_renewable_inputs(raw_now, hours=hours)
+
+    schedule = []
+    for h, hour_info in enumerate(hourly_inputs):
+        solar_vec = build_solar_feature_vec(hour_info["solar_raw"], _solar_ckpt, solar_hist)
+        solar_pred = _predict(_solar_model, _solar_ckpt, solar_vec, _DEVICE)
+        solar_pred = apply_solar_physics_floor(solar_pred, hour_info["solar_raw"])
+        solar_hist = (solar_hist + [solar_pred])[-max_solar_lag:]
+
+        wind_raw_hour = dict(raw_now)
+        wind_raw_hour["wind_speed"] = hour_info["wind_speed"]
+        wind_vec = build_wind_feature_vec(wind_raw_hour, _wind_ckpt, wind_hist)
+        wind_pred = _predict(_wind_model, _wind_ckpt, wind_vec, _DEVICE)
+        wind_pred = apply_wind_cutout_ceiling(wind_pred, wind_raw_hour)
+        wind_hist = (wind_hist + [wind_pred])[-max_wind_lag:]
+
+        solar_kw = max(solar_pred, 0.0)
+        wind_kw = max(wind_pred, 0.0)
+        demand_kw = _forecast_demand_kw(hour_info["hour_of_day"])
+
+        dispatch = dispatch_energy(
+            consumption=demand_kw,
+            solar=solar_kw,
+            wind=wind_kw,
+            battery_charge=battery_kwh,
+            battery_capacity=GRID_CONFIG["battery_capacity_kwh"],
+            is_calamity=is_calamity,
+        )
+
+        battery_kwh = dispatch["new_battery_charge"]
+        net_battery_kw = dispatch["battery_charged"] - dispatch["battery_used"]  # + charging, - discharging
+
+        schedule.append({
+            "hour": h,
+            "diesel_kw": round(dispatch["diesel_used"], 3),
+            "solar_kw": round(solar_kw, 3),
+            "wind_kw": round(wind_kw, 3),
+            "battery_kw": round(net_battery_kw, 3),
+            "demand_kw": round(demand_kw, 3),
+            "battery_soc_after": round(battery_kwh, 3),
+            "reason": _explain_dispatch(dispatch, is_calamity),
+        })
+
+    # NOTE: this GET has side effects (like the existing /predict does) --
+    # it advances the persisted lag history and burns down diesel
+    # health/restock based on this forecast's total diesel usage.
+    _set_location_state(power_cache, lat, lon, {
+        "solar_power_history": solar_hist,
+        "wind_power_history": wind_hist,
+    })
+    _save_cache(power_cache)
+
+    total_diesel_kwh = sum(item["diesel_kw"] for item in schedule)
+    grid_state["battery_kwh"] = battery_kwh
+    grid_state["diesel_health"] = max(
+        0.0, grid_state["diesel_health"] - total_diesel_kwh * GRID_CONFIG["diesel_health_wear_per_kwh"]
+    )
+    grid_state["restock_days_remaining"] = max(
+        0.0, grid_state["restock_days_remaining"] - total_diesel_kwh / GRID_CONFIG["diesel_daily_ration_kwh"]
+    )
+    grid_state["last_discharge_kw"] = abs(schedule[0]["battery_kw"]) if schedule[0]["battery_kw"] < 0 else 0.0
+    _save_grid_state(grid_state)
+
+    return schedule
+
+
 # --------------------------------------------------------------------------
 # API layer -- FastAPI, no argparse.
 # --------------------------------------------------------------------------
@@ -482,6 +832,44 @@ def predict_get(
 def predict_post(req: PredictRequest):
     try:
         return predict_power(req.lat, req.lon, estimate_uncertainty=req.uncertainty)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/status")
+def get_status():
+    """Current microgrid status: battery, diesel health/restock, and an
+    overall severity derived from simple thresholds (see
+    SEVERITY_THRESHOLDS). See the MICROGRID STATE section above for what's
+    real vs. placeholder here."""
+    state = _load_grid_state()
+    severity = _determine_severity(
+        state["battery_kwh"], state["diesel_health"], state["restock_days_remaining"]
+    )
+    return {
+        "severity": severity,
+        "battery": {
+            "capacity_kwh": GRID_CONFIG["battery_capacity_kwh"],
+            "usable_kwh": GRID_CONFIG["battery_usable_kwh"],
+            "current_kwh": round(state["battery_kwh"], 2),
+            "discharge_kw": round(state.get("last_discharge_kw", 0.0), 2),
+        },
+        "diesel_health": round(state["diesel_health"], 1),
+        "restock_days_remaining": round(state["restock_days_remaining"], 1),
+    }
+
+
+@router.get("/schedule")
+def get_schedule(
+    lat: float = Query(DEFAULT_SITE_LAT, description="Latitude (defaults to configured site)"),
+    lon: float = Query(DEFAULT_SITE_LON, description="Longitude (defaults to configured site)"),
+    is_calamity: bool = Query(False, description="Storm-prep mode: prioritize charging the battery over consumption"),
+):
+    """12-hour (H+0..H+11) dispatch schedule -- see build_schedule()."""
+    try:
+        return build_schedule(lat, lon, is_calamity=is_calamity, hours=12)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
