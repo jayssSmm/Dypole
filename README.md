@@ -80,3 +80,26 @@ Then select the **LIVE API** toggle in the dashboard control bar. The app will a
 - `AlertBanner.tsx`: Priority Operational Alerts & live event journal with timestamped tags (`T-10M`, `T-1H 12M`, etc.).
 - `ScheduleMatrixChart.tsx`: Stacked area/bar telemetry matrix color-coded by source (warm amber diesel, cool cyan/blue solar/wind/battery).
 - `AllocationTimeline.tsx`: Timestamped dispatch decision log showing newest-first reason strings.
+
+
+
+
+
+## 🎛️ Edge Node Firmware Layer (ESP32 + FreeRTOS)
+
+To ensure high-precision telemetry sampling without blocking system execution, the firmware was built natively using **FreeRTOS** on the ESP32 microcontroller within the Arduino ecosystem. 
+
+### 🛠️ Embedded Tech Stack
+*   **Hardware Platform:** ESP32 (Dual-Core Tensilica LX6)
+*   **Execution Architecture:** FreeRTOS (Real-Time Operating System)
+*   **Development Environment:** Arduino IDE
+
+### 🏗️ Firmware Architecture & Multitasking Logic
+Instead of a standard, fragile `void loop()`, the firmware decouples system operations into deterministic, independent tasks managed by the FreeRTOS scheduler:
+
+1. **Telemetry Sampling Task (Priority 2):** High-frequency task dedicated to reading raw physical sensor signals (simulating Microgrid Battery SoC, Solar, and Wind generation inputs).
+2. **Data Serialization Task (Priority 1):** Periodically wakes up to structuralize raw data variables into a packed JSON payload, directly matching the backend SCADA `GET /status` schema contracts.
+
+### 🔗 Architecture Expansion (Future Scope)
+While currently operating as an isolated edge device for local verification, the firmware is architected to scale. The next iteration will spin up a third concurrent FreeRTOS task running on Core 0 to dispatch these JSON data streams over Wi-Fi via an HTTP POST client or MQTT broker directly to the active Node.js backend.
+
