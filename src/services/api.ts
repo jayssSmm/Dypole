@@ -16,7 +16,7 @@ import {
 } from './weatherService';
 
 // Configurable API base URL from env var or default localhost:8000
-export const API_BASE_URL = 'https://dypole.onrender.com/';
+export const API_BASE_URL = 'https://dypole.onrender.com';
 
 // Configurable polling interval (30 seconds as specified in requirements)
 export const POLL_INTERVAL_MS = 30000;
