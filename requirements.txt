@@ -4,3 +4,4 @@ psutil
 numpy
 pandas
 requests
+uvicorn
