@@ -14,14 +14,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.UseModel import router as Pred_router   # legacy standalone /predict, /health
 from routes import router as microgrid_router          # /api/status, /api/schedule, /api/history, /api/calamity
 
 
 def create_app():
     app = FastAPI(title="Solar + Wind Power Prediction API")
 
-    app.include_router(Pred_router)
     app.include_router(microgrid_router)
 
     app.add_middleware(

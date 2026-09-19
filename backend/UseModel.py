@@ -95,7 +95,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
+from backend.extension import PredictRequest
+
+from backend.psutils.get_memory_db import get_memory_mb
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weather_api.weather import (  # noqa: E402
@@ -367,6 +369,7 @@ _DEVICE = torch.device("cpu")
 # Models are loaded once per process, not once per request.
 _solar_model, _solar_ckpt = None, None
 _wind_model, _wind_ckpt = None, None
+RAM_USED = None
 _models_missing = False
 
 
@@ -379,10 +382,13 @@ def _ensure_models_loaded():
         # Fail loudly but gracefully (503) instead of crashing torch.load.
         _models_missing = True
         return
+    
+    initial_ram = get_memory_mb()
     if _solar_model is None:
         _solar_model, _solar_ckpt = _load_model(SOLAR_CKPT_PATH, _DEVICE)
     if _wind_model is None:
         _wind_model, _wind_ckpt = _load_model(WIND_CKPT_PATH, _DEVICE)
+    final_ram = get_memory_mb()
 
 
 def predict_power(lat, lon, device=None, estimate_uncertainty=False):
@@ -805,82 +811,3 @@ def build_schedule(lat, lon, is_calamity=False, hours=12):
     _save_grid_state(grid_state)
 
     return schedule
-
-
-# --------------------------------------------------------------------------
-# API layer -- FastAPI, no argparse.
-# --------------------------------------------------------------------------
-router = APIRouter()
-
-
-class PredictRequest(BaseModel):
-    lat: float
-    lon: float
-    uncertainty: bool = False
-
-
-@router.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-@router.get("/predict")
-def predict_get(
-    lat: float = Query(..., description="Latitude"),
-    lon: float = Query(..., description="Longitude"),
-    uncertainty: bool = Query(False, description="Also return MC-dropout uncertainty"),
-):
-    try:
-        return predict_power(lat, lon, estimate_uncertainty=uncertainty)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/predict")
-def predict_post(req: PredictRequest):
-    try:
-        return predict_power(req.lat, req.lon, estimate_uncertainty=req.uncertainty)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/status")
-def get_status():
-    """Current microgrid status: battery, diesel health/restock, and an
-    overall severity derived from simple thresholds (see
-    SEVERITY_THRESHOLDS). See the MICROGRID STATE section above for what's
-    real vs. placeholder here."""
-    state = _load_grid_state()
-    severity = _determine_severity(
-        state["battery_kwh"], state["diesel_health"], state["restock_days_remaining"]
-    )
-    return {
-        "severity": severity,
-        "battery": {
-            "capacity_kwh": GRID_CONFIG["battery_capacity_kwh"],
-            "usable_kwh": GRID_CONFIG["battery_usable_kwh"],
-            "current_kwh": round(state["battery_kwh"], 2),
-            "discharge_kw": round(state.get("last_discharge_kw", 0.0), 2),
-        },
-        "diesel_health": round(state["diesel_health"], 1),
-        "restock_days_remaining": round(state["restock_days_remaining"], 1),
-    }
-
-
-@router.get("/schedule")
-def get_schedule(
-    lat: float = Query(DEFAULT_SITE_LAT, description="Latitude (defaults to configured site)"),
-    lon: float = Query(DEFAULT_SITE_LON, description="Longitude (defaults to configured site)"),
-    is_calamity: bool = Query(False, description="Storm-prep mode: prioritize charging the battery over consumption"),
-):
-    """12-hour (H+0..H+11) dispatch schedule -- see build_schedule()."""
-    try:
-        return build_schedule(lat, lon, is_calamity=is_calamity, hours=12)
-    except RuntimeError as e:
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
