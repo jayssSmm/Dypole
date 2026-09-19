@@ -94,8 +94,6 @@ from datetime import datetime
 import numpy as np
 import torch
 import torch.nn as nn
-from fastapi import APIRouter, HTTPException, Query
-from backend.extension import PredictRequest
 
 from backend.psutils.get_memory_db import get_memory_mb
 
@@ -375,6 +373,7 @@ _models_missing = False
 
 def _ensure_models_loaded():
     global _solar_model, _solar_ckpt, _wind_model, _wind_ckpt, _models_missing
+    global RAM_USED
     if _models_missing:
         return
     if not (os.path.exists(SOLAR_CKPT_PATH) and os.path.exists(WIND_CKPT_PATH)):
@@ -389,6 +388,8 @@ def _ensure_models_loaded():
     if _wind_model is None:
         _wind_model, _wind_ckpt = _load_model(WIND_CKPT_PATH, _DEVICE)
     final_ram = get_memory_mb()
+
+    RAM_USED = final_ram - initial_ram
 
 
 def predict_power(lat, lon, device=None, estimate_uncertainty=False):
@@ -729,6 +730,7 @@ def build_schedule(lat, lon, is_calamity=False, hours=12):
     """Runs the 12-hour dispatch loop and persists the resulting
     battery/diesel state. Returns the list of hourly schedule dicts."""
     raw_now = fetch_current(lat, lon)
+    global RAM_USED
 
     _ensure_models_loaded()
     if _models_missing:
@@ -788,6 +790,7 @@ def build_schedule(lat, lon, is_calamity=False, hours=12):
             "demand_kw": round(demand_kw, 3),
             "battery_soc_after": round(battery_kwh, 3),
             "reason": _explain_dispatch(dispatch, is_calamity),
+            "RAM_USED":RAM_USED
         })
 
     # NOTE: this GET has side effects (like the existing /predict does) --
