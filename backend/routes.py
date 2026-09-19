@@ -132,3 +132,7 @@ def get_schedule(
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get('/ping')
+def ping():
+    return {'ping':'pong'}
