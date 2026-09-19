@@ -97,15 +97,6 @@ import torch.nn as nn
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-# --------------------------------------------------------------------------
-# Wire up to weather_api/weather.py (fetch_current + the shared column
-# name constants), assuming this script lives alongside that folder.
-#
-# We insert THIS file's own directory (backend/) onto sys.path, not
-# backend/weather_api/. Inserting the weather_api/ folder itself would
-# make `import weather_api.weather` look for
-# backend/weather_api/weather_api/weather.py, which doesn't exist.
-# --------------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from weather_api.weather import (  # noqa: E402
     fetch_current,
@@ -120,11 +111,6 @@ WIND_CKPT_PATH = os.path.join(MODELS_DIR, "wind_power_model.pt")
 
 CACHE_PATH = os.path.join(_HERE, ".pow_lag_cache.json")
 
-
-# --------------------------------------------------------------------------
-# Sanity ranges -- MUST stay in sync with VALID_RANGES in
-# train_solar_power_model.py and train_wind_power_model.py.
-# --------------------------------------------------------------------------
 WEATHER_VALID_RANGES = {
     # wind-model raw feature names
     "wind_speed": (0, 60),
@@ -183,11 +169,6 @@ def apply_wind_cutout_ceiling(pred, raw, cutout=WIND_CUT_OUT_SPEED):
     return pred
 
 
-# --------------------------------------------------------------------------
-# Model architecture -- must match the training scripts exactly so the
-# saved state_dict keys line up. Both checkpoints use this same class;
-# use_batchnorm is auto-detected per-checkpoint below.
-# --------------------------------------------------------------------------
 class PowerMLP(nn.Module):
     """Unified MLP whose layout is chosen to match what a checkpoint was
     actually trained with:
@@ -262,21 +243,12 @@ def _predict(model, ckpt, feature_vec, device):
 
 
 def _enable_mc_dropout(model):
-    """Flip ONLY Dropout layers into train mode; everything else (notably
-    BatchNorm) stays in eval mode so it keeps using its saved running
-    stats. Calling plain model.train() would also put BatchNorm into
-    training mode, which computes stats from the current batch -- and
-    crashes on a batch of size 1 (a single live prediction) with
-    'Expected more than 1 value per channel when training'."""
     for module in model.modules():
         if isinstance(module, nn.Dropout):
             module.train()
 
 
 def _predict_with_uncertainty(model, ckpt, feature_vec, device, n_samples=30):
-    """Same as _predict, but runs n_samples stochastic forward passes with
-    dropout left active to get a cheap mean/std estimate. Safe for
-    BatchNorm architectures at batch size 1 -- see _enable_mc_dropout."""
     x = np.asarray(feature_vec, dtype=np.float32).reshape(1, -1)
     x_mean, x_std = ckpt["x_mean"], ckpt["x_std"]
     y_mean, y_std = ckpt["y_mean"], ckpt["y_std"]
@@ -612,15 +584,16 @@ DEFAULT_SITE_LON = 77.2
 DEMAND_TARGET_KW = 220.0  # real load requirement, as given
 DEMAND_NOISE_KW = 10.0    # +/- random noise per hour, as given
 
+GRID_CONFIG_VERSION = 2  # bump whenever battery/diesel scale constants change
 
 def _default_grid_state():
     return {
+        "_config_version": GRID_CONFIG_VERSION,
         "battery_kwh": GRID_CONFIG["battery_initial_kwh"],
         "diesel_health": GRID_CONFIG["diesel_health_initial"],
         "restock_days_remaining": GRID_CONFIG["diesel_restock_days_initial"],
         "last_discharge_kw": 0.0,
     }
-
 
 def _load_grid_state():
     if not os.path.exists(GRID_STATE_PATH):
@@ -628,13 +601,14 @@ def _load_grid_state():
     try:
         with open(GRID_STATE_PATH, "r") as f:
             state = json.load(f)
-        # fill in any keys missing from an older state file
+        if state.get("_config_version") != GRID_CONFIG_VERSION:
+            # scale/config changed since this file was written -- stale, reset
+            return _default_grid_state()
         defaults = _default_grid_state()
         defaults.update(state)
         return defaults
     except (json.JSONDecodeError, OSError):
         return _default_grid_state()
-
 
 def _save_grid_state(state):
     with open(GRID_STATE_PATH, "w") as f:
