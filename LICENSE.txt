@@ -1,0 +1,9 @@
+Copyright (c) 2026 [DyPole]
+
+ALL RIGHTS RESERVED.
+
+This software, source code, and associated documentation are the exclusive property of the copyright holders for the Smart India Hackathon project.
+
+No part of this repository may be reproduced, copied, cloned, plagiarized, distributed, modified, sublicensed, or transmitted in any form or by any means—including copying text, scraping code, screenshotting for OCR, or adapting the logic—without the prior written permission of the copyright holders.
+
+Any unauthorized use or plagiarism of this work will be reported immediately to the Smart India Hackathon (SIH) organizing committee and evaluation jury, and will be subject to legal action under the Indian Copyright Act, 1957.
