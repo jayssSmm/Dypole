@@ -1,3 +1,17 @@
+## ⚠️ Copyright & Plagiarism Notice
+
+**© 2026 [DyPole] | Smart India Hackathon (SIH)**
+
+**ALL RIGHTS RESERVED.**
+
+This repository contains the official prototype developed for the **Smart India Hackathon 2026**. 
+
+* **No Cloning or Copying:** Unauthorized copying, cloning, modifying, or distribution of this source code, architecture, or design layout is strictly prohibited.
+* **Academic Integrity:** Any form of plagiarism or unauthorized replication identified during the hackathon will be immediately reported to the **SIH Organizing Committee** and the evaluation jury for disqualification.
+* **Legal Action:** This work is protected under the Indian Copyright Act, 1957. 
+
+*For inquiries or evaluation permissions, please contact the repository owners.*
+
 # Maitri Polar SCADA Telemetry Hub (DyPole Microgrid Control)
 
 > **Enterprise-Grade Polar Microgrid SCADA Dashboard** for Antarctic Research Station Operations (Maitri Antarctic Station Microgrid, 70°46'S 11°44'E).
